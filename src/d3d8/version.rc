@@ -14,7 +14,7 @@ BEGIN
   BEGIN
     BLOCK "080904b0"
     BEGIN
-      VALUE "CompanyName",      "DXVK"
+      VALUE "CompanyName",      "HemH Gaming"
       VALUE "FileDescription",  "Direct3D 8 Runtime"
       VALUE "FileVersion",      "10.0.17763.1 (WinBuild.160101.0800)"
       VALUE "InternalName",     "D3D8.dll"
