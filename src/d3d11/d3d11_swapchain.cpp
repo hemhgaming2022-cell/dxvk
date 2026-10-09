@@ -2,13 +2,7 @@
 #include "d3d11_device.h"
 #include "d3d11_swapchain.h"
 
-#include "../dxvk/dxvk_latency_builtin.h"
-#include "../dxvk/dxvk_shader_spirv.h"
-
 #include "../util/util_win32_compat.h"
-
-#include <d3d11_composition_vert.h>
-#include <d3d11_composition_frag.h>
 
 namespace dxvk {
 
@@ -69,11 +63,16 @@ namespace dxvk {
     m_surfaceFactory(pSurfaceFactory),
     m_desc(*pDesc),
     m_device(pDevice->GetDXVKDevice()),
+    m_context(m_device->createContext(DxvkContextType::Supplementary)),
     m_frameLatencyCap(pDevice->GetOptions()->maxFrameLatency) {
     CreateFrameLatencyEvent();
     CreatePresenter();
-    CreateBackBuffers();
+    CreateBackBuffer();
     CreateBlitter();
+    CreateHud();
+
+    if (!pDevice->GetOptions()->deferSurfaceCreation)
+      RecreateSwapChain();
   }
 
 
@@ -83,10 +82,10 @@ namespace dxvk {
     if (this_thread::isInModuleDetachment())
       return;
 
-    m_presenter->destroyResources();
+    m_device->waitForSubmission(&m_presentStatus);
+    m_device->waitForIdle();
     
     DestroyFrameLatencyEvent();
-    DestroyLatencyTracker();
   }
 
 
@@ -100,9 +99,7 @@ namespace dxvk {
 
     if (riid == __uuidof(IUnknown)
      || riid == __uuidof(IDXGIVkSwapChain)
-     || riid == __uuidof(IDXGIVkSwapChain1)
-     || riid == __uuidof(IDXGIVkSwapChain2)
-     || riid == __uuidof(IDXGIVkSwapChain3)) {
+     || riid == __uuidof(IDXGIVkSwapChain1)) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -143,12 +140,12 @@ namespace dxvk {
           void**                    ppBuffer) {
     InitReturnPtr(ppBuffer);
 
-    if (BufferId >= m_backBuffers.size()) {
-      Logger::err("D3D11: GetImage: Invalid buffer ID");
+    if (BufferId > 0) {
+      Logger::err("D3D11: GetImage: BufferId > 0 not supported");
       return DXGI_ERROR_UNSUPPORTED;
     }
 
-    return m_backBuffers[BufferId]->QueryInterface(riid, ppBuffer);
+    return m_backBuffer->QueryInterface(riid, ppBuffer);
   }
 
 
@@ -180,21 +177,21 @@ namespace dxvk {
     const DXGI_SWAP_CHAIN_DESC1*    pDesc,
     const UINT*                     pNodeMasks,
           IUnknown* const*          ppPresentQueues) {
-    if (m_desc.Format != pDesc->Format)
-      m_presenter->setSurfaceFormat(GetSurfaceFormat(pDesc->Format));
-
-    if (m_desc.Width != pDesc->Width || m_desc.Height != pDesc->Height)
-      m_presenter->setSurfaceExtent({ pDesc->Width, pDesc->Height });
+    m_dirty |= m_desc.Format      != pDesc->Format
+            || m_desc.Width       != pDesc->Width
+            || m_desc.Height      != pDesc->Height
+            || m_desc.BufferCount != pDesc->BufferCount
+            || m_desc.Flags       != pDesc->Flags;
 
     m_desc = *pDesc;
-    CreateBackBuffers();
+    CreateBackBuffer();
     return S_OK;
   }
 
 
   HRESULT STDMETHODCALLTYPE D3D11SwapChain::SetPresentRegion(
     const RECT*                     pRegion) {
-    Logger::err("D3D11SwapChain::SetPresentRegion: Stub");
+    // TODO implement
     return E_NOTIMPL;
   }
 
@@ -257,31 +254,35 @@ namespace dxvk {
           UINT                      SyncInterval,
           UINT                      PresentFlags,
     const DXGI_PRESENT_PARAMETERS*  pPresentParameters) {
+    if (!(PresentFlags & DXGI_PRESENT_TEST))
+      m_dirty |= m_presenter->setSyncInterval(SyncInterval) != VK_SUCCESS;
+
     HRESULT hr = S_OK;
 
-    // [HemH Gaming Turbo Boost]
-    // Puwersahang i-override ang SyncInterval sa 0 para ma-unlock ang 200 - 300+ FPS
-    // at maiwasan ang biglaang pagbagsak ng FPS sa 45 kapag may kalaban o skills!
-    SyncInterval = 0;
+    if (!m_presenter->hasSwapChain()) {
+      RecreateSwapChain();
+      m_dirty = false;
+    }
+
+    if (!m_presenter->hasSwapChain())
+      hr = DXGI_STATUS_OCCLUDED;
 
     if (m_device->getDeviceStatus() != VK_SUCCESS)
       hr = DXGI_ERROR_DEVICE_RESET;
 
-    if (PresentFlags & DXGI_PRESENT_TEST) {
-      if (hr != S_OK)
-        return hr;
-
-      VkResult status = m_presenter->checkSwapChainStatus();
-      return status == VK_SUCCESS ? S_OK : DXGI_STATUS_OCCLUDED;
-    }
+    if (PresentFlags & DXGI_PRESENT_TEST)
+      return hr;
 
     if (hr != S_OK) {
       SyncFrameLatency();
       return hr;
     }
 
+    if (std::exchange(m_dirty, false))
+      RecreateSwapChain();
+
     try {
-      hr = PresentImage(0, pPresentParameters);
+      hr = PresentImage(SyncInterval);
     } catch (const DxvkError& e) {
       Logger::err(e.message());
       hr = E_FAIL;
@@ -292,18 +293,6 @@ namespace dxvk {
     // applications using the semaphore may deadlock. This works because
     // we do not increment the frame ID in those situations.
     SyncFrameLatency();
-
-    // Ignore latency stuff if presentation failed
-    DxvkLatencyStats latencyStats = { };
-
-    if (hr == S_OK && m_latency) {
-      latencyStats = m_latency->getStatistics(m_frameId);
-      m_latency->sleepAndBeginFrame(m_frameId + 1, 0.0);
-    }
-
-    if (m_latencyHud)
-      m_latencyHud->accumulateStats(latencyStats);
-
     return hr;
   }
 
@@ -312,8 +301,7 @@ namespace dxvk {
           DXGI_COLOR_SPACE_TYPE     ColorSpace) {
     UINT supportFlags = 0;
 
-    VkColorSpaceKHR vkColorSpace = ConvertColorSpace(ColorSpace);
-
+    const VkColorSpaceKHR vkColorSpace = ConvertColorSpace(ColorSpace);
     if (m_presenter->supportsColorSpace(vkColorSpace))
       supportFlags |= DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
 
@@ -323,14 +311,13 @@ namespace dxvk {
 
   HRESULT STDMETHODCALLTYPE D3D11SwapChain::SetColorSpace(
           DXGI_COLOR_SPACE_TYPE     ColorSpace) {
-    VkColorSpaceKHR colorSpace = ConvertColorSpace(ColorSpace);
-
-    if (!m_presenter->supportsColorSpace(colorSpace))
+    if (!(CheckColorSpaceSupport(ColorSpace) & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT))
       return E_INVALIDARG;
 
-    m_colorSpace = colorSpace;
+    const VkColorSpaceKHR vkColorSpace = ConvertColorSpace(ColorSpace);
+    m_dirty |= vkColorSpace != m_colorspace;
+    m_colorspace = vkColorSpace;
 
-    m_presenter->setSurfaceFormat(GetSurfaceFormat(m_desc.Format));
     return S_OK;
   }
 
@@ -338,8 +325,10 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D11SwapChain::SetHDRMetaData(
     const DXGI_VK_HDR_METADATA*     pMetaData) {
     // For some reason this call always seems to succeed on Windows
-    if (pMetaData->Type == DXGI_HDR_METADATA_TYPE_HDR10)
-      m_presenter->setHdrMetadata(ConvertHDRMetadata(pMetaData->HDR10));
+    if (pMetaData->Type == DXGI_HDR_METADATA_TYPE_HDR10) {
+      m_hdrMetadata = ConvertHDRMetadata(pMetaData->HDR10);
+      m_dirtyHdrMetadata = true;
+    }
 
     return S_OK;
   }
@@ -353,231 +342,141 @@ namespace dxvk {
 
   void STDMETHODCALLTYPE D3D11SwapChain::GetFrameStatistics(
           DXGI_VK_FRAME_STATISTICS* pFrameStatistics) {
-    PresenterTimingFeedback feedback = {};
-
-    if (m_presenter)
-      feedback = m_presenter->queryPresentTiming();
-
-    pFrameStatistics->PresentCount = std::max<uint64_t>(feedback.frameId, DXGI_MAX_SWAP_CHAIN_BUFFERS) - DXGI_MAX_SWAP_CHAIN_BUFFERS;
-    pFrameStatistics->PresentQPCTime = feedback.presentTime;
+    std::lock_guard<dxvk::mutex> lock(m_frameStatisticsLock);
+    *pFrameStatistics = m_frameStatistics;
   }
 
 
-  void STDMETHODCALLTYPE D3D11SwapChain::SetTargetFrameRate(
-          double                    FrameRate) {
-    // [HemH Gaming] Laging uncapped (0.0) para sa maximum frame rates
-    m_targetFrameRate = 0.0;
-
-    if (m_presenter != nullptr)
-      m_presenter->setFrameRateLimit(0.0, GetActualFrameLatency());
-  }
-
-
-  HRESULT STDMETHODCALLTYPE D3D11SwapChain::SetBackgroundColor(
-    const DXGI_RGBA*                pColor) {
-    m_clearColor.float32[0] = pColor->r;
-    m_clearColor.float32[1] = pColor->g;
-    m_clearColor.float32[2] = pColor->b;
-    m_clearColor.float32[3] = pColor->a;
-    return S_OK;
-  }
-
-
-  HRESULT STDMETHODCALLTYPE D3D11SwapChain::SetRotation(
-          DXGI_MODE_ROTATION        Rotation) {
-    if (Rotation != DXGI_MODE_ROTATION_IDENTITY) {
-      Logger::err(str::format("D3D11SwapChain::SetRotation: Rotation ", Rotation, " not supported."));
-      return E_NOTIMPL;
-    }
-
-    return S_OK;
-  }
-
-
-  Rc<DxvkImageView> D3D11SwapChain::GetBackBufferView() {
-    Rc<DxvkImage> image = GetCommonTexture(m_backBuffers[0].ptr())->GetImage();
-
-    if (m_compositionBuffer)
-      image = m_compositionBuffer;
-
-    DxvkImageViewKey key;
-    key.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    key.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
-    key.format = image->info().format;
-    key.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
-    key.mipIndex = 0u;
-    key.mipCount = 1u;
-    key.layerIndex = 0u;
-    key.layerCount = 1u;
-
-    return image->createView(key);
-  }
-
-
-  HRESULT D3D11SwapChain::PresentImage(
-            UINT                      SyncInterval,
-      const DXGI_PRESENT_PARAMETERS*  pPresentParameters) {
+  HRESULT D3D11SwapChain::PresentImage(UINT SyncInterval) {
     // Flush pending rendering commands before
     auto immediateContext = m_parent->GetContext();
-    auto immediateContextLock = immediateContext->LockContext();
+    immediateContext->EndFrame();
+    immediateContext->Flush();
 
-    immediateContext->EndFrame(m_latency);
-    immediateContext->ExecuteFlush(GpuFlushType::ExplicitFlush,
-      nullptr, m_parent->Is11on12Device());
+    for (uint32_t i = 0; i < SyncInterval || i < 1; i++) {
+      SynchronizePresent();
 
-    // [HemH Gaming Turbo Boost] Force 0 Sync Interval
-    m_presenter->setSyncInterval(0);
+      if (!m_presenter->hasSwapChain())
+        return i ? S_OK : DXGI_STATUS_OCCLUDED;
 
-    // Presentation semaphores and WSI swap chain image
-    if (m_latency)
-      m_latency->notifyCpuPresentBegin(m_frameId + 1u);
+      // Presentation semaphores and WSI swap chain image
+      PresenterInfo info = m_presenter->info();
+      PresenterSync sync;
 
-    PresenterSync sync;
-    Rc<DxvkImage> backBuffer;
+      uint32_t imageIndex = 0;
 
-    VkResult status = m_presenter->acquireNextImage(sync, backBuffer);
+      VkResult status = m_presenter->acquireNextImage(sync, imageIndex);
 
-    if (status != VK_SUCCESS && m_latency)
-      m_latency->discardTimings();
+      while (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR) {
+        RecreateSwapChain();
 
-    if (status < 0)
-      return E_FAIL;
-
-    if (status == VK_NOT_READY)
-      return DXGI_STATUS_OCCLUDED;
-
-    VkExtent2D dstSize = { backBuffer->info().extent.width, backBuffer->info().extent.height };
-
-    VkRect2D srcRect = ComputeSrcPresentRect();
-    VkRect2D dstRect = ComputeDstPresentRect(dstSize, srcRect.extent);
-
-    // Incremental presentation is only supported with flip model presentation
-    // on native, not 100% sure about the exact validation here.
-    bool incrementalPresent = UseIncrementalPresent(pPresentParameters);
-
-    bool sequential = m_desc.SwapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL ||
-                      m_desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-
-    if (incrementalPresent && !sequential) {
-      Logger::err("D3D11: Incremental present only supported with sequential present modes.");
-      return DXGI_ERROR_INVALID_CALL;
-    }
-
-    DirtyRectList dirtyRects;
-
-    if (incrementalPresent) {
-      CompositeIncrementalPresent(immediateContext, pPresentParameters);
-
-      // Redraw everything if the HUD is active since we don't
-      // keep track of the exact screen areas there. Likewise,
-      // nope out if there is any scaling going on.
-      if (!m_hasHud && dstRect.extent != srcRect.extent) {
-        VkRect2D bounds = dstRect;
-        bounds.offset.x -= srcRect.offset.x;
-        bounds.offset.y -= srcRect.offset.y;
-
-        dirtyRects = NormalizeDirtyRects(pPresentParameters, bounds);
+        if (!m_presenter->hasSwapChain())
+          return i ? S_OK : DXGI_STATUS_OCCLUDED;
+        
+        info = m_presenter->info();
+        status = m_presenter->acquireNextImage(sync, imageIndex);
       }
-    } else {
-      // Nuke incremental present image out of existence to
-      // save memory, also to pick the correct source image
-      m_compositionBuffer = nullptr;
-      m_compositionScroll = nullptr;
+
+      if (m_hdrMetadata && m_dirtyHdrMetadata) {
+        m_presenter->setHdrMetadata(*m_hdrMetadata);
+        m_dirtyHdrMetadata = false;
+      }
+
+      m_context->beginRecording(
+        m_device->createCommandList());
+      
+      m_blitter->presentImage(m_context.ptr(),
+        m_imageViews.at(imageIndex), VkRect2D(),
+        m_swapImageView, VkRect2D());
+
+      if (m_hud != nullptr)
+        m_hud->render(m_context, info.format, info.imageExtent);
+      
+      SubmitPresent(immediateContext, sync, i);
     }
 
-    m_frameId += 1;
+    return S_OK;
+  }
+
+
+  void D3D11SwapChain::SubmitPresent(
+          D3D11ImmediateContext*  pContext,
+    const PresenterSync&          Sync,
+          uint32_t                Repeat) {
+    auto lock = pContext->LockContext();
+
+    // Bump frame ID as necessary
+    if (!Repeat)
+      m_frameId += 1;
 
     // Present from CS thread so that we don't
     // have to synchronize with it first.
-    DxvkImageViewKey viewInfo = { };
-    viewInfo.viewType   = VK_IMAGE_VIEW_TYPE_2D;
-    viewInfo.usage      = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    viewInfo.format     = backBuffer->info().format;
-    viewInfo.aspects    = VK_IMAGE_ASPECT_COLOR_BIT;
-    viewInfo.mipIndex   = 0u;
-    viewInfo.mipCount   = 1u;
-    viewInfo.layerIndex = 0u;
-    viewInfo.layerCount = 1u;
+    m_presentStatus.result = VK_NOT_READY;
 
-    immediateContext->EmitCs([
-      cDevice         = m_device,
-      cBlitter        = m_blitter,
-      cBackBuffer     = backBuffer->createView(viewInfo),
-      cSwapImage      = GetBackBufferView(),
-      cSync           = sync,
-      cPresenter      = m_presenter,
-      cLatency        = m_latency,
-      cColorSpace     = m_colorSpace,
-      cFrameId        = m_frameId,
-      cDirtyRects     = std::move(dirtyRects),
-      cClearColor     = m_clearColor,
-      cSrcRect        = srcRect,
-      cDstRect        = dstRect
+    pContext->EmitCs([this,
+      cRepeat      = Repeat,
+      cSync        = Sync,
+      cHud         = m_hud,
+      cPresentMode = m_presenter->info().presentMode,
+      cFrameId     = m_frameId,
+      cCommandList = m_context->endRecording()
     ] (DxvkContext* ctx) {
-      // Update back buffer color space as necessary
-      if (cSwapImage->image()->info().colorSpace != cColorSpace) {
-        DxvkImageUsageInfo usage = { };
-        usage.colorSpace = cColorSpace;
+      cCommandList->setWsiSemaphores(cSync);
+      m_device->submitCommandList(cCommandList, nullptr);
 
-        ctx->ensureImageCompatibility(cSwapImage->image(), usage);
-      }
+      if (cHud != nullptr && !cRepeat)
+        cHud->update();
 
-      // Blit the D3D back buffer onto the actual Vulkan
-      // swap chain and render the HUD if we have one.
-      auto contextObjects = ctx->beginExternalRendering();
+      uint64_t frameId = cRepeat ? 0 : cFrameId;
 
-      cBlitter->present(contextObjects, cClearColor,
-        cBackBuffer, cDstRect, cSwapImage, cSrcRect);
-
-      // Submit current command list and present
-      ctx->synchronizeWsi(cSync);
-      ctx->flushCommandList(nullptr, nullptr);
-
-      cDevice->presentImage(cPresenter, cLatency, cFrameId,
-        cDirtyRects.size(), cDirtyRects.data(), nullptr);
+      m_device->presentImage(m_presenter,
+        cPresentMode, frameId, &m_presentStatus);
     });
 
-    if (m_backBuffers.size() > 1u)
-      RotateBackBuffers(immediateContext);
-
-    immediateContext->FlushCsChunk();
-
-    if (m_latency) {
-      m_latency->notifyCpuPresentEnd(m_frameId);
-
-      if (m_latency->needsAutoMarkers()) {
-        immediateContext->EmitCs([
-          cLatency = m_latency,
-          cFrameId = m_frameId
-        ] (DxvkContext* ctx) {
-          ctx->beginLatencyTracking(cLatency, cFrameId + 1u);
-        });
-      }
-    }
-
-    return S_OK;
+    pContext->FlushCsChunk();
   }
 
 
-  void D3D11SwapChain::RotateBackBuffers(D3D11ImmediateContext* ctx) {
-    small_vector<Rc<DxvkImage>, 4> images;
+  void D3D11SwapChain::SynchronizePresent() {
+    // Recreate swap chain if the previous present call failed
+    VkResult status = m_device->waitForSubmission(&m_presentStatus);
+    
+    if (status != VK_SUCCESS)
+      RecreateSwapChain();
+  }
 
-    for (uint32_t i = 0; i < m_backBuffers.size(); i++)
-      images.push_back(GetCommonTexture(m_backBuffers[i].ptr())->GetImage());
 
-    ctx->EmitCs([
-      cImages = std::move(images)
-    ] (DxvkContext* ctx) {
-      auto allocation = cImages[0]->storage();
+  void D3D11SwapChain::RecreateSwapChain() {
+    // Ensure that we can safely destroy the swap chain
+    m_device->waitForSubmission(&m_presentStatus);
+    m_device->waitForIdle();
 
-      for (size_t i = 0u; i + 1 < cImages.size(); i++) {
-        ctx->invalidateImage(cImages[i], cImages[i + 1]->storage(),
-          cImages[i + 1]->info().layout);
-      }
+    m_presentStatus.result = VK_SUCCESS;
+    m_dirtyHdrMetadata = true;
 
-      ctx->invalidateImage(cImages[cImages.size() - 1u],
-        std::move(allocation), cImages[0]->info().layout);
-    });
+    PresenterDesc presenterDesc;
+    presenterDesc.imageExtent     = { m_desc.Width, m_desc.Height };
+    presenterDesc.imageCount      = PickImageCount(m_desc.BufferCount + 1);
+    presenterDesc.numFormats      = PickFormats(m_desc.Format, presenterDesc.formats);
+    presenterDesc.fullScreenExclusive = PickFullscreenMode();
+
+    VkResult vr = m_presenter->recreateSwapChain(presenterDesc);
+
+    if (vr == VK_ERROR_SURFACE_LOST_KHR) {
+      vr = m_presenter->recreateSurface([this] (VkSurfaceKHR* surface) {
+        return CreateSurface(surface);
+      });
+
+      if (vr)
+        throw DxvkError(str::format("D3D11SwapChain: Failed to recreate surface: ", vr));
+
+      vr = m_presenter->recreateSwapChain(presenterDesc);
+    }
+
+    if (vr)
+      throw DxvkError(str::format("D3D11SwapChain: Failed to recreate swap chain: ", vr));
+    
+    CreateRenderTargetViews();
   }
 
 
@@ -590,41 +489,76 @@ namespace dxvk {
 
 
   void D3D11SwapChain::CreatePresenter() {
-    PresenterDesc presenterDesc = { };
-    // [HemH Gaming] Laging defer surface creation para sa smooth player spawning
-    presenterDesc.deferSurfaceCreation = true;
+    PresenterDesc presenterDesc;
+    presenterDesc.imageExtent     = { m_desc.Width, m_desc.Height };
+    presenterDesc.imageCount      = PickImageCount(m_desc.BufferCount + 1);
+    presenterDesc.numFormats      = PickFormats(m_desc.Format, presenterDesc.formats);
+    presenterDesc.fullScreenExclusive = PickFullscreenMode();
 
-    m_presenter = new Presenter(m_device, m_frameLatencySignal, presenterDesc, [
-      cAdapter  = m_device->adapter(),
-      cFactory  = m_surfaceFactory
-    ] (VkSurfaceKHR* surface) {
-      return cFactory->CreateSurface(
-        cAdapter->vki()->instance(),
-        cAdapter->handle(), surface);
-    });
-
-    m_presenter->setSurfaceFormat(GetSurfaceFormat(m_desc.Format));
-    m_presenter->setSurfaceExtent({ m_desc.Width, m_desc.Height });
-    m_presenter->setFrameRateLimit(0.0, GetActualFrameLatency());
-
-    m_latency = m_device->createLatencyTracker(m_presenter);
-
-    Com<D3D11ReflexDevice> reflex = GetReflexDevice();
-    reflex->RegisterLatencyTracker(m_latency);
+    m_presenter = new Presenter(m_device, m_frameLatencySignal, presenterDesc);
+    m_presenter->setFrameRateLimit(m_parent->GetOptions()->maxFrameRate);
   }
 
 
-  void D3D11SwapChain::CreateBackBuffers() {
+  VkResult D3D11SwapChain::CreateSurface(VkSurfaceKHR* pSurface) {
+    Rc<DxvkAdapter> adapter = m_device->adapter();
+
+    return m_surfaceFactory->CreateSurface(
+      adapter->vki()->instance(),
+      adapter->handle(), pSurface);
+  }
+
+
+  void D3D11SwapChain::CreateRenderTargetViews() {
+    PresenterInfo info = m_presenter->info();
+
+    m_imageViews.clear();
+    m_imageViews.resize(info.imageCount);
+
+    DxvkImageCreateInfo imageInfo;
+    imageInfo.type        = VK_IMAGE_TYPE_2D;
+    imageInfo.format      = info.format.format;
+    imageInfo.flags       = 0;
+    imageInfo.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.extent      = { info.imageExtent.width, info.imageExtent.height, 1 };
+    imageInfo.numLayers   = 1;
+    imageInfo.mipLevels   = 1;
+    imageInfo.usage       = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    imageInfo.stages      = 0;
+    imageInfo.access      = 0;
+    imageInfo.tiling      = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.layout      = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    imageInfo.shared      = VK_TRUE;
+
+    DxvkImageViewCreateInfo viewInfo;
+    viewInfo.type         = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format       = info.format.format;
+    viewInfo.usage        = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    viewInfo.aspect       = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.minLevel     = 0;
+    viewInfo.numLevels    = 1;
+    viewInfo.minLayer     = 0;
+    viewInfo.numLayers    = 1;
+
+    for (uint32_t i = 0; i < info.imageCount; i++) {
+      VkImage imageHandle = m_presenter->getImage(i).image;
+      
+      Rc<DxvkImage> image = new DxvkImage(
+        m_device.ptr(), imageInfo, imageHandle,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+      m_imageViews[i] = new DxvkImageView(
+        m_device->vkd(), image, viewInfo);
+    }
+  }
+
+
+  void D3D11SwapChain::CreateBackBuffer() {
     // Explicitly destroy current swap image before
     // creating a new one to free up resources
-    m_backBuffers.clear();
-
-    m_compositionBuffer = nullptr;
-    m_compositionScroll = nullptr;
-
-    bool sequential = m_desc.SwapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL ||
-                      m_desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-    uint32_t backBufferCount = sequential ? m_desc.BufferCount : 1u;
+    m_swapImage         = nullptr;
+    m_swapImageView     = nullptr;
+    m_backBuffer        = nullptr;
 
     // Create new back buffer
     D3D11_COMMON_TEXTURE_DESC desc;
@@ -655,47 +589,57 @@ namespace dxvk {
     
     DXGI_USAGE dxgiUsage = DXGI_USAGE_BACK_BUFFER;
 
-    for (uint32_t i = 0; i < backBufferCount; i++) {
-      if (m_desc.SwapEffect == DXGI_SWAP_EFFECT_DISCARD
-       || m_desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD)
-         dxgiUsage |= DXGI_USAGE_DISCARD_ON_PRESENT;
+    if (m_desc.SwapEffect == DXGI_SWAP_EFFECT_DISCARD
+     || m_desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD)
+      dxgiUsage |= DXGI_USAGE_DISCARD_ON_PRESENT;
 
-      m_backBuffers.push_back(new D3D11Texture2D(
-        m_parent, this, &desc, dxgiUsage));
+    m_backBuffer = new D3D11Texture2D(m_parent, this, &desc, dxgiUsage);
+    m_swapImage = GetCommonTexture(m_backBuffer.ptr())->GetImage();
 
-      dxgiUsage |= DXGI_USAGE_READ_ONLY;
-    }
-
-    small_vector<Rc<DxvkImage>, 4> images;
-
-    for (uint32_t i = 0; i < backBufferCount; i++)
-      images.push_back(GetCommonTexture(m_backBuffers[i].ptr())->GetImage());
-
-    // Initialize images so that we can use them. Clearing
+    // Create an image view that allows the
+    // image to be bound as a shader resource.
+    DxvkImageViewCreateInfo viewInfo;
+    viewInfo.type       = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format     = m_swapImage->info().format;
+    viewInfo.usage      = VK_IMAGE_USAGE_SAMPLED_BIT;
+    viewInfo.aspect     = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.minLevel   = 0;
+    viewInfo.numLevels  = 1;
+    viewInfo.minLayer   = 0;
+    viewInfo.numLayers  = 1;
+    m_swapImageView = m_device->createImageView(m_swapImage, viewInfo);
+    
+    // Initialize the image so that we can use it. Clearing
     // to black prevents garbled output for the first frame.
-    m_parent->GetContext()->InjectCs(DxvkCsQueue::HighPriority, [
-      cImages = std::move(images)
-    ] (DxvkContext* ctx) {
-      for (size_t i = 0; i < cImages.size(); i++) {
-        ctx->setDebugName(cImages[i], str::format("Back buffer ", i).c_str());
-        ctx->initImage(cImages[i], VK_IMAGE_LAYOUT_UNDEFINED);
-      }
-    });
+    VkImageSubresourceRange subresources;
+    subresources.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+    subresources.baseMipLevel   = 0;
+    subresources.levelCount     = 1;
+    subresources.baseArrayLayer = 0;
+    subresources.layerCount     = 1;
+
+    m_context->beginRecording(
+      m_device->createCommandList());
+    
+    m_context->initImage(m_swapImage,
+      subresources, VK_IMAGE_LAYOUT_UNDEFINED);
+
+    m_device->submitCommandList(
+      m_context->endRecording(),
+      nullptr);
   }
 
 
   void D3D11SwapChain::CreateBlitter() {
-    Rc<hud::Hud> hud = hud::Hud::createHud(m_device);
+    m_blitter = new DxvkSwapchainBlitter(m_device);    
+  }
 
-    if (hud) {
-      hud->addItem<hud::HudClientApiItem>("api", 1, GetApiName());
 
-      if (m_latency)
-        m_latencyHud = hud->addItem<hud::HudLatencyItem>("latency", 4);
-    }
+  void D3D11SwapChain::CreateHud() {
+    m_hud = hud::Hud::createHud(m_device);
 
-    m_hasHud = hud && !hud->empty();
-    m_blitter = new DxvkSwapchainBlitter(m_device, std::move(hud));
+    if (m_hud != nullptr)
+      m_hud->addItem<hud::HudClientApiItem>("api", 1, GetApiName());
   }
 
 
@@ -704,29 +648,20 @@ namespace dxvk {
   }
 
 
-  void D3D11SwapChain::DestroyLatencyTracker() {
-    // Need to make sure the context stops using
-    // the tracker for submissions
-    m_parent->GetContext()->InjectCs(DxvkCsQueue::Ordered, [
-      cLatency = m_latency
-    ] (DxvkContext* ctx) {
-      ctx->endLatencyTracking(cLatency);
-    });
-
-    Com<D3D11ReflexDevice> reflex = GetReflexDevice();
-    reflex->UnregisterLatencyTracker(m_latency);
-  }
-
-
   void D3D11SwapChain::SyncFrameLatency() {
     // Wait for the sync event so that we respect the maximum frame latency
     m_frameLatencySignal->wait(m_frameId - GetActualFrameLatency());
 
-    m_frameLatencySignal->setCallback(m_frameId, [
+    m_frameLatencySignal->setCallback(m_frameId, [this,
+      cFrameId           = m_frameId,
       cFrameLatencyEvent = m_frameLatencyEvent
     ] () {
       if (cFrameLatencyEvent)
         ReleaseSemaphore(cFrameLatencyEvent, 1, nullptr);
+
+      std::lock_guard<dxvk::mutex> lock(m_frameStatisticsLock);
+      m_frameStatistics.PresentCount = cFrameId - DXGI_MAX_SWAP_CHAIN_BUFFERS;
+      m_frameStatistics.PresentQPCTime = dxvk::high_resolution_clock::get_counter();
     });
   }
 
@@ -748,467 +683,53 @@ namespace dxvk {
   }
 
 
-  VkSurfaceFormatKHR D3D11SwapChain::GetSurfaceFormat(DXGI_FORMAT Format) {
+  uint32_t D3D11SwapChain::PickFormats(
+          DXGI_FORMAT               Format,
+          VkSurfaceFormatKHR*       pDstFormats) {
+    uint32_t n = 0;
+
     switch (Format) {
       default:
         Logger::warn(str::format("D3D11SwapChain: Unexpected format: ", m_desc.Format));
-        [[fallthrough]];
-
+      [[fallthrough]];
+      
       case DXGI_FORMAT_R8G8B8A8_UNORM:
-      case DXGI_FORMAT_B8G8R8A8_UNORM:
-        return { VK_FORMAT_R8G8B8A8_UNORM, m_colorSpace };
-
+      case DXGI_FORMAT_B8G8R8A8_UNORM: {
+        pDstFormats[n++] = { VK_FORMAT_R8G8B8A8_UNORM, m_colorspace };
+        pDstFormats[n++] = { VK_FORMAT_B8G8R8A8_UNORM, m_colorspace };
+      } break;
+      
       case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-      case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-        return { VK_FORMAT_R8G8B8A8_SRGB, m_colorSpace };
-
-      case DXGI_FORMAT_R10G10B10A2_UNORM:
-        return { VK_FORMAT_A2B10G10R10_UNORM_PACK32, m_colorSpace };
-
-      case DXGI_FORMAT_R16G16B16A16_FLOAT:
-        return { VK_FORMAT_R16G16B16A16_SFLOAT, m_colorSpace };
-    }
-  }
-
-
-  Com<D3D11ReflexDevice> D3D11SwapChain::GetReflexDevice() {
-    Com<ID3DLowLatencyDevice> llDevice;
-    m_parent->QueryInterface(__uuidof(ID3DLowLatencyDevice), reinterpret_cast<void**>(&llDevice));
-
-    return static_cast<D3D11ReflexDevice*>(llDevice.ptr());
-  }
-
-
-  VkRect2D D3D11SwapChain::ComputeSrcPresentRect() const {
-    VkRect2D rect = {};
-    rect.extent.width = m_desc.Width;
-    rect.extent.height = m_desc.Height;
-    return rect;
-  }
-
-
-  VkRect2D D3D11SwapChain::ComputeDstPresentRect(VkExtent2D DstSize, VkExtent2D SrcSize) const {
-    VkRect2D result = {};
-
-    switch (m_desc.Scaling) {
-      default:
-      case DXGI_SCALING_STRETCH: {
-        result.extent = DstSize;
+      case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: {
+        pDstFormats[n++] = { VK_FORMAT_R8G8B8A8_SRGB, m_colorspace };
+        pDstFormats[n++] = { VK_FORMAT_B8G8R8A8_SRGB, m_colorspace };
       } break;
-
-      case DXGI_SCALING_NONE: {
-        // TODO honour WS_EX_LAYOUTRTL
-        result.extent = SrcSize;
+      
+      case DXGI_FORMAT_R10G10B10A2_UNORM: {
+        pDstFormats[n++] = { VK_FORMAT_A2B10G10R10_UNORM_PACK32, m_colorspace };
+        pDstFormats[n++] = { VK_FORMAT_A2R10G10B10_UNORM_PACK32, m_colorspace };
       } break;
-
-      case DXGI_SCALING_ASPECT_RATIO_STRETCH: {
-        if (DstSize.width * SrcSize.height > SrcSize.width * DstSize.height) {
-          // Destination is wider than source, offset horizontally
-          result.extent.width = (SrcSize.width * DstSize.height) / SrcSize.height;
-          result.extent.height = DstSize.height;
-          result.offset.x = int32_t(DstSize.width - result.extent.width) / 2;
-        } else if (DstSize.width * SrcSize.height < SrcSize.width * DstSize.height) {
-          // Destination is taller than source, offset vertically
-          result.extent.width = DstSize.width;
-          result.extent.height = (SrcSize.height * DstSize.width) / SrcSize.width;
-          result.offset.y = int32_t(DstSize.height - result.extent.height) / 2;
-        } else {
-          // Aspect ratio matches, simple stretch.
-          result.extent = DstSize;
-        }
+      
+      case DXGI_FORMAT_R16G16B16A16_FLOAT: {
+        pDstFormats[n++] = { VK_FORMAT_R16G16B16A16_SFLOAT, m_colorspace };
       } break;
     }
 
-    return result;
+    return n;
   }
 
 
-  void D3D11SwapChain::CompositeIncrementalPresent(
-          D3D11ImmediateContext*   pContext,
-    const DXGI_PRESENT_PARAMETERS* pPresentParameters) {
-    Rc<DxvkImage> backBuffer = GetCommonTexture(m_backBuffers.front().ptr())->GetImage();
-
-    if (!m_compositionVs || !m_compositionFs)
-      CreateCompositionShaders();
-
-    pContext->ResetDirtyTracking();
-    pContext->ResetCommandListState();
-
-    if (!m_compositionBuffer) {
-      // Create front buffer as a shader-readable render target
-      DxvkImageCreateInfo imageInfo = backBuffer->info();
-      imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-                      | VK_IMAGE_USAGE_SAMPLED_BIT
-                      | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                      | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-      imageInfo.stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
-                       | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-                       | VK_PIPELINE_STAGE_TRANSFER_BIT;
-      imageInfo.access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
-                       | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
-                       | VK_ACCESS_SHADER_READ_BIT
-                       | VK_ACCESS_TRANSFER_READ_BIT
-                       | VK_ACCESS_TRANSFER_WRITE_BIT;
-      imageInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-      imageInfo.debugName = "Composition";
-
-      m_compositionBuffer = m_device->createImage(imageInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
-      // Create another image that we can render the scroll region to
-      imageInfo.debugName = "Composition (Scroll)";
-      m_compositionScroll = m_device->createImage(imageInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
-      // Create internal images for incremental presentation. If this is the
-      // first frame to use incremental present, then we know for sure that
-      // the last back buffer contains the full contents last presented, so
-      // simply copy the last back buffer to it.
-      pContext->EmitCs([
-        cPrevImage    = GetCommonTexture(m_backBuffers.back().ptr())->GetImage(),
-        cCurrImage    = m_compositionBuffer,
-        cScrollImage  = m_compositionScroll
-      ] (DxvkContext* ctx) {
-        VkExtent3D extent = cCurrImage->info().extent;
-
-        VkImageSubresourceLayers subresource = {};
-        subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        subresource.layerCount = 1u;
-
-        ctx->initImage(cScrollImage, VK_IMAGE_LAYOUT_UNDEFINED);
-        ctx->initImage(cCurrImage, VK_IMAGE_LAYOUT_UNDEFINED);
-        ctx->copyImage(cCurrImage, subresource, VkOffset3D(),
-          cPrevImage, subresource, VkOffset3D(), extent);
-      });
-    }
-
-    DxvkImageViewKey renderViewInfo = {};
-    renderViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    renderViewInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    renderViewInfo.format = backBuffer->info().format;
-    renderViewInfo.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    renderViewInfo.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
-    renderViewInfo.mipCount = 1u;
-    renderViewInfo.layerCount = 1u;
-    renderViewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle({
-      VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G,
-      VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A });
-
-    DxvkImageViewKey shaderViewInfo = renderViewInfo;
-    shaderViewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
-    shaderViewInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-    // Swapchain resolution
-    VkExtent2D resolution = {
-      backBuffer->info().extent.width,
-      backBuffer->info().extent.height };
-
-    // Set up all render state
-    pContext->EmitCs([
-      cVs = m_compositionVs,
-      cFs = m_compositionFs
-    ] (DxvkContext* ctx) mutable {
-      ctx->beginDebugLabel(vk::makeLabel(0xc6c0dc, "DXGI incremental present"));
-
-      ctx->bindShader<VK_SHADER_STAGE_VERTEX_BIT>(std::move(cVs));
-      ctx->bindShader<VK_SHADER_STAGE_FRAGMENT_BIT>(std::move(cFs));
-
-      DxvkInputAssemblyState iaState = {};
-      iaState.setPrimitiveTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP);
-
-      ctx->setInputAssemblyState(iaState);
-
-      DxvkRasterizerState rsState = {};
-      rsState.setPolygonMode(VK_POLYGON_MODE_FILL);
-      rsState.setCullMode(VK_CULL_MODE_BACK_BIT);
-      rsState.setFrontFace(VK_FRONT_FACE_COUNTER_CLOCKWISE);
-      rsState.setSampleCount(VK_SAMPLE_COUNT_1_BIT);
-
-      ctx->setRasterizerState(rsState);
-    });
-
-    // Check if we have a valid, non-empty scroll region and a non-zero
-    // scroll offset. If so, we need to copy the scroll area first.
-    bool scroll = false;
-
-    if (pPresentParameters->pScrollRect && pPresentParameters->pScrollOffset) {
-      scroll = pPresentParameters->pScrollRect->right > pPresentParameters->pScrollRect->left
-            && pPresentParameters->pScrollRect->bottom > pPresentParameters->pScrollRect->top
-            && (pPresentParameters->pScrollOffset->x || pPresentParameters->pScrollOffset->y);
-    }
-
-    if (scroll) {
-      pContext->EmitCs([
-        cSrcView      = m_compositionBuffer->createView(shaderViewInfo),
-        cDstView      = m_compositionScroll->createView(renderViewInfo),
-        cScrollRect   = *pPresentParameters->pScrollRect,
-        cScrollOffset = *pPresentParameters->pScrollOffset
-      ] (DxvkContext* ctx) mutable {
-        DxvkAttachment attachment = {};
-        attachment.view = cDstView;
-
-        ctx->clearRenderTarget(attachment, 0u, VkClearValue(), VK_IMAGE_ASPECT_COLOR_BIT);
-
-        DxvkRenderTargets rts = {};
-        rts.color[0].view = std::move(cDstView);
-
-        ctx->bindRenderTargets(std::move(rts), 0u);
-        ctx->bindResourceImageView(VK_SHADER_STAGE_FRAGMENT_BIT, 0, std::move(cSrcView));
-
-        DxvkViewport viewport = {};
-        viewport.scissor.extent.width = uint32_t(cScrollRect.right - cScrollRect.left);
-        viewport.scissor.extent.height = uint32_t(cScrollRect.bottom - cScrollRect.top);
-        viewport.viewport.width = float(viewport.scissor.extent.width);
-        viewport.viewport.height = float(viewport.scissor.extent.height);
-        viewport.viewport.maxDepth = 1.0f;
-
-        ctx->setViewports(1u, &viewport);
-
-        CompositionArgs args = {};
-        args.srcOffset.x = cScrollRect.left - cScrollOffset.x;
-        args.srcOffset.y = cScrollRect.top - cScrollOffset.y;
-        args.extent = viewport.scissor.extent;
-        args.resolution = viewport.scissor.extent;
-
-        ctx->pushData(VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(args), &args);
-
-        VkDrawIndirectCommand draw = {};
-        draw.vertexCount = 4u;
-        draw.instanceCount = 1u;
-
-        ctx->draw(1u, &draw);
-      });
-    }
-
-    // Bind actual front buffer for rendering now
-    pContext->EmitCs([
-      cDstView    = m_compositionBuffer->createView(renderViewInfo),
-      cResolution = resolution
-    ] (DxvkContext* ctx) mutable {
-      DxvkRenderTargets rts = {};
-      rts.color[0].view = std::move(cDstView);
-
-      ctx->bindRenderTargets(std::move(rts), 0u);
-
-      DxvkViewport viewport = {};
-      viewport.scissor.extent = cResolution;
-      viewport.viewport.width = float(cResolution.width);
-      viewport.viewport.height = float(cResolution.height);
-      viewport.viewport.maxDepth = 1.0f;
-
-      ctx->setViewports(1u, &viewport);
-    });
-
-    if (scroll) {
-      pContext->EmitCs([
-        cScrollView   = m_compositionScroll->createView(shaderViewInfo),
-        cBufferView   = backBuffer->createView(shaderViewInfo),
-        cScrollRect   = *pPresentParameters->pScrollRect,
-        cScrollOffset = *pPresentParameters->pScrollOffset,
-        cResolution   = resolution
-      ] (DxvkContext* ctx) mutable {
-        CompositionArgs args = {};
-        args.srcOffset = { cScrollRect.left - cScrollOffset.x, cScrollRect.top - cScrollOffset.y };
-        args.dstOffset = { cScrollRect.left, cScrollRect.top };
-        args.extent.width = cScrollRect.right - cScrollRect.left;
-        args.extent.height = cScrollRect.bottom - cScrollRect.top;
-        args.resolution = cResolution;
-
-        VkDrawIndirectCommand draw = {};
-        draw.vertexCount = 4u;
-        draw.instanceCount = 1u;
-
-        ctx->bindResourceImageView(VK_SHADER_STAGE_FRAGMENT_BIT, 0, std::move(cBufferView));
-        ctx->pushData(VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(args), &args);
-        ctx->draw(1u, &draw);
-
-        args.srcOffset = { 0, 0 };
-        args.dstOffset = { cScrollRect.left, cScrollRect.top };
-        args.extent.width = cScrollRect.right - cScrollRect.left - std::abs(cScrollOffset.x);
-        args.extent.height = cScrollRect.bottom - cScrollRect.top - std::abs(cScrollOffset.y);
-        args.resolution = cResolution;
-
-        if (cScrollOffset.x > 0) {
-          args.srcOffset.x += cScrollOffset.x;
-          args.dstOffset.x += cScrollOffset.x;
-        }
-
-        if (cScrollOffset.y > 0) {
-          args.srcOffset.y += cScrollOffset.y;
-          args.dstOffset.y += cScrollOffset.y;
-        }
-
-        ctx->bindResourceImageView(VK_SHADER_STAGE_FRAGMENT_BIT, 0, std::move(cScrollView));
-        ctx->pushData(VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(args), &args);
-        ctx->draw(1u, &draw);
-      });
-    }
-
-    // Apply all the actual dirty rects
-    if (pPresentParameters->DirtyRectsCount) {
-      pContext->EmitCs([
-        cSrcView = backBuffer->createView(shaderViewInfo)
-      ] (DxvkContext* ctx) mutable {
-        ctx->bindResourceImageView(VK_SHADER_STAGE_FRAGMENT_BIT, 0, std::move(cSrcView));
-      });
-
-      for (uint32_t i = 0u; i < pPresentParameters->DirtyRectsCount; i++) {
-        RECT rect = pPresentParameters->pDirtyRects[i];
-
-        if (rect.right > rect.left && rect.bottom > rect.top) {
-          pContext->EmitCs([
-            cRect       = rect,
-            cResolution = resolution
-          ] (DxvkContext* ctx) mutable {
-            VkDrawIndirectCommand draw = {};
-            draw.vertexCount = 4u;
-            draw.instanceCount = 1u;
-
-            CompositionArgs args = {};
-            args.srcOffset.x = cRect.left;
-            args.srcOffset.y = cRect.top;
-            args.dstOffset.x = cRect.left;
-            args.dstOffset.y = cRect.top;
-            args.extent.width = cRect.right - cRect.left;
-            args.extent.height = cRect.bottom - cRect.top;
-            args.resolution = cResolution;
-
-            ctx->pushData(VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(args), &args);
-            ctx->draw(1u, &draw);
-          });
-        }
-      }
-    }
-
-    // Write composition image back to last back buffer, apparently
-    // this is supposed to be fully preserved across frames.
-    pContext->EmitCs([
-      cComposition = m_compositionBuffer,
-      cBackBuffer  = GetCommonTexture(m_backBuffers.back().ptr())->GetImage()
-    ] (DxvkContext* ctx) {
-      VkImageSubresourceLayers subresource = {};
-      subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-      subresource.layerCount = 1u;
-
-      ctx->copyImage(cBackBuffer, subresource, VkOffset3D(),
-        cComposition, subresource, VkOffset3D(),
-        cComposition->mipLevelExtent(0u));
-
-      ctx->endDebugLabel();
-    });
-
-    pContext->RestoreCommandListState();
+  uint32_t D3D11SwapChain::PickImageCount(
+          UINT                      Preferred) {
+    int32_t option = m_parent->GetOptions()->numBackBuffers;
+    return option > 0 ? uint32_t(option) : uint32_t(Preferred);
   }
 
 
-
-  bool D3D11SwapChain::UseIncrementalPresent(
-    const DXGI_PRESENT_PARAMETERS* pPresentParameters) const {
-    if (!pPresentParameters)
-      return false;
-
-    if (pPresentParameters->DirtyRectsCount) {
-      bool hasFullRect = false;
-
-      RECT fullRect = {};
-      fullRect.right = m_desc.Width;
-      fullRect.bottom = m_desc.Height;
-
-      for (uint32_t i = 0u; i < pPresentParameters->DirtyRectsCount; i++) {
-        const auto& rect = pPresentParameters->pDirtyRects[i];
-
-        hasFullRect = hasFullRect || (rect.left <= fullRect.left && rect.top <= fullRect.top
-          && rect.right >= fullRect.right && rect.bottom >= fullRect.bottom);
-      }
-
-      if (!hasFullRect)
-        return true;
-    }
-
-    if (pPresentParameters->pScrollRect && pPresentParameters->pScrollOffset) {
-      const auto& rect = *pPresentParameters->pScrollRect;
-      const auto& offset = *pPresentParameters->pScrollOffset;
-
-      if (rect.left < rect.right && rect.top < rect.bottom && (offset.x || offset.y))
-        return true;
-    }
-
-    return false;
-  }
-
-
-  void D3D11SwapChain::CreateCompositionShaders() {
-    const std::array<DxvkBindingInfo, 1> fsBindings = {{
-      { 0u, 0u, 0u, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1u, VK_IMAGE_VIEW_TYPE_2D, VK_ACCESS_SHADER_READ_BIT },
-    }};
-
-    DxvkSpirvShaderCreateInfo vsInfo = { };
-    vsInfo.localPushData = DxvkPushDataBlock(0, sizeof(CompositionArgs), sizeof(uint32_t), 0u);
-    vsInfo.debugName = "DXGI_VS";
-    m_compositionVs = new DxvkSpirvShader(vsInfo, d3d11_composition_vert);
-
-    DxvkSpirvShaderCreateInfo fsInfo = { };
-    fsInfo.bindingCount = fsBindings.size();
-    fsInfo.bindings = fsBindings.data();
-    fsInfo.debugName = "DXGI_FS";
-    m_compositionFs = new DxvkSpirvShader(fsInfo, d3d11_composition_frag);
-  }
-
-
-  D3D11SwapChain::DirtyRectList D3D11SwapChain::NormalizeDirtyRects(const DXGI_PRESENT_PARAMETERS* pPresentParameters, VkRect2D Bounds) const {
-    DirtyRectList result;
-
-    if (pPresentParameters->pScrollRect && pPresentParameters->pScrollOffset
-     && (pPresentParameters->pScrollOffset->x || pPresentParameters->pScrollOffset->y))
-      AddDirtyRect(result, *pPresentParameters->pScrollRect, Bounds);
-
-    for (uint32_t i = 0u; i < pPresentParameters->DirtyRectsCount; i++)
-      AddDirtyRect(result, pPresentParameters->pDirtyRects[i], Bounds);
-
-    return result;
-  }
-
-
-  void D3D11SwapChain::AddDirtyRect(DirtyRectList& List, RECT Rect, VkRect2D Bounds) const {
-    // Clamp rect to screen area, and ignore if the result is empty
-    Rect.left = std::max<int32_t>(Rect.left + Bounds.offset.x, 0);
-    Rect.top = std::max<int32_t>(Rect.top + Bounds.offset.y, 0);
-    Rect.right = std::min<int32_t>(Rect.right + Bounds.offset.x, Bounds.extent.width);
-    Rect.bottom = std::min<int32_t>(Rect.bottom + Bounds.offset.y, Bounds.extent.height);
-
-    if (Rect.left >= Rect.right || Rect.top >= Rect.bottom)
-      return;
-
-    // Scan existing list and remove any rects that overlap,
-    // merging the overlapping rectangles into the new rect.
-    auto iter = List.begin();
-
-    while (iter != List.end()) {
-      RECT next = {};
-      next.left = iter->offset.x;
-      next.right = iter->offset.x + iter->extent.width;
-      next.top = iter->offset.y;
-      next.bottom = iter->offset.y + iter->extent.height;
-
-      bool overlap = next.left < Rect.right && Rect.left < next.right
-                  && next.top < Rect.bottom && Rect.top < next.bottom;
-
-      if (overlap) {
-        iter = List.erase(iter);
-
-        Rect.left = std::min(Rect.left, next.left);
-        Rect.top = std::min(Rect.top, next.top);
-        Rect.right = std::max(Rect.right, next.right);
-        Rect.bottom = std::max(Rect.bottom, next.bottom);
-      } else {
-        iter++;
-      }
-    }
-
-    // No more overlapping rectangles in list, add new one.
-    auto& vkRect = List.emplace_back();
-    vkRect.offset.x = Rect.left;
-    vkRect.offset.y = Rect.top;
-    vkRect.extent.width = Rect.right - Rect.left;
-    vkRect.extent.height = Rect.bottom - Rect.top;
+  VkFullScreenExclusiveEXT D3D11SwapChain::PickFullscreenMode() {
+    return m_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH
+      ? VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT
+      : VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
   }
 
 
@@ -1222,9 +743,7 @@ namespace dxvk {
     uint32_t flHi = (featureLevel >> 12);
     uint32_t flLo = (featureLevel >> 8) & 0x7;
 
-    bool is11On12 = m_parent->Is11on12Device();
-
-    return str::format("D3D", apiVersion, (is11On12 ? "On12" : ""), " FL", flHi, "_", flLo);
+    return str::format("D3D", apiVersion, " FL", flHi, "_", flLo);
   }
 
 }
