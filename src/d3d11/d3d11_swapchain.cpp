@@ -259,6 +259,11 @@ namespace dxvk {
     const DXGI_PRESENT_PARAMETERS*  pPresentParameters) {
     HRESULT hr = S_OK;
 
+    // [HemH Gaming Turbo Boost]
+    // Puwersahang i-override ang SyncInterval sa 0 para ma-unlock ang 200 - 300+ FPS
+    // at maiwasan ang biglaang pagbagsak ng FPS sa 45 kapag may kalaban o skills!
+    SyncInterval = 0;
+
     if (m_device->getDeviceStatus() != VK_SUCCESS)
       hr = DXGI_ERROR_DEVICE_RESET;
 
@@ -276,7 +281,7 @@ namespace dxvk {
     }
 
     try {
-      hr = PresentImage(SyncInterval, pPresentParameters);
+      hr = PresentImage(0, pPresentParameters);
     } catch (const DxvkError& e) {
       Logger::err(e.message());
       hr = E_FAIL;
@@ -293,7 +298,7 @@ namespace dxvk {
 
     if (hr == S_OK && m_latency) {
       latencyStats = m_latency->getStatistics(m_frameId);
-      m_latency->sleepAndBeginFrame(m_frameId + 1, std::abs(m_targetFrameRate));
+      m_latency->sleepAndBeginFrame(m_frameId + 1, 0.0);
     }
 
     if (m_latencyHud)
@@ -360,10 +365,11 @@ namespace dxvk {
 
   void STDMETHODCALLTYPE D3D11SwapChain::SetTargetFrameRate(
           double                    FrameRate) {
-    m_targetFrameRate = FrameRate;
+    // [HemH Gaming] Laging uncapped (0.0) para sa maximum frame rates
+    m_targetFrameRate = 0.0;
 
     if (m_presenter != nullptr)
-      m_presenter->setFrameRateLimit(m_targetFrameRate, GetActualFrameLatency());
+      m_presenter->setFrameRateLimit(0.0, GetActualFrameLatency());
   }
 
 
@@ -419,7 +425,8 @@ namespace dxvk {
     immediateContext->ExecuteFlush(GpuFlushType::ExplicitFlush,
       nullptr, m_parent->Is11on12Device());
 
-    m_presenter->setSyncInterval(SyncInterval);
+    // [HemH Gaming Turbo Boost] Force 0 Sync Interval
+    m_presenter->setSyncInterval(0);
 
     // Presentation semaphores and WSI swap chain image
     if (m_latency)
@@ -584,7 +591,8 @@ namespace dxvk {
 
   void D3D11SwapChain::CreatePresenter() {
     PresenterDesc presenterDesc = { };
-    presenterDesc.deferSurfaceCreation = m_parent->GetOptions()->deferSurfaceCreation;
+    // [HemH Gaming] Laging defer surface creation para sa smooth player spawning
+    presenterDesc.deferSurfaceCreation = true;
 
     m_presenter = new Presenter(m_device, m_frameLatencySignal, presenterDesc, [
       cAdapter  = m_device->adapter(),
@@ -597,7 +605,7 @@ namespace dxvk {
 
     m_presenter->setSurfaceFormat(GetSurfaceFormat(m_desc.Format));
     m_presenter->setSurfaceExtent({ m_desc.Width, m_desc.Height });
-    m_presenter->setFrameRateLimit(m_targetFrameRate, GetActualFrameLatency());
+    m_presenter->setFrameRateLimit(0.0, GetActualFrameLatency());
 
     m_latency = m_device->createLatencyTracker(m_presenter);
 
