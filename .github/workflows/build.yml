@@ -1,0 +1,38 @@
+name: Build Custom DXVK (HemH Gaming)
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup MinGW & Meson Compiler
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            meson \
+            ninja-build \
+            glslang-tools \
+            mingw-w64 \
+            mingw-w64-tools \
+            wine \
+            wine32 \
+            wine64
+
+      - name: Compile DXVK Binaries
+        run: |
+          chmod +x package-release.sh
+          ./package-release.sh master ./output-binaries --no-package
+
+      - name: Upload Compiled DLLs
+        uses: actions/upload-artifact@v4
+        with:
+          name: HemHGaming-DXVK-Release
+          path: output-binaries/
