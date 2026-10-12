@@ -35,6 +35,14 @@ namespace dxvk {
     m_presenter->QueryInterface(__uuidof(IDXGIVkSwapChain3), reinterpret_cast<void**>(&m_presenter3));
 
     m_frameRateOption = m_factory->GetOptions()->maxFrameRate;
+    if (m_frameRateOption <= 0.0)
+      m_frameRateOption = 1500.0; // [1500 FPS UNCAP DEFAULT]
+
+    // [FLIP-DISCARD UPGRADE]: Promote legacy DISCARD to FLIP_DISCARD for 0ms DWM latency
+    if (m_desc.SwapEffect == DXGI_SWAP_EFFECT_DISCARD) {
+      m_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+      m_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    }
 
     // Query monitor info form DXVK's DXGI factory, if available
     m_factory->QueryInterface(__uuidof(IDXGIVkMonitorInfo), reinterpret_cast<void**>(&m_monitorInfo));
@@ -356,6 +364,10 @@ namespace dxvk {
     if (SyncInterval > 4)
       return DXGI_ERROR_INVALID_CALL;
 
+    // [1500 FPS UNCAP FIX]: Puwersahin ang SyncInterval sa 0 para walang 60Hz/144Hz limit
+    SyncInterval = 0;
+    PresentFlags |= DXGI_PRESENT_ALLOW_TEARING;
+
     if ((m_desc.SwapEffect == DXGI_SWAP_EFFECT_DISCARD || m_desc.SwapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL) && wsi::isMinimized(m_window))
       return DXGI_STATUS_OCCLUDED;
     bool occluded = !m_descFs.Windowed && wsi::isOccluded(m_window) && !wsi::isMinimized(m_window);
@@ -364,6 +376,8 @@ namespace dxvk {
 
     if (options->syncInterval >= 0)
       SyncInterval = options->syncInterval;
+    else
+      SyncInterval = 0; // Siguradong 0 VSync para sa 1500 FPS!
 
     UpdateGlobalHDRState();
 
@@ -821,7 +835,7 @@ namespace dxvk {
     DXGI_VK_MONITOR_DATA* monitorInfo = nullptr;
 
     if (SUCCEEDED(AcquireMonitorData(m_monitor, &monitorInfo))) {
-      if (monitorInfo->pSwapChain == this)
+      if (!monitorInfo->pSwapChain)
         monitorInfo->pSwapChain = nullptr;
       
       SetGammaControl(0, nullptr);
@@ -1064,13 +1078,6 @@ namespace dxvk {
   HRESULT DxgiSwapChain::UpdateSourceSize(
           UINT                    Width,
           UINT                    Height) {
-    // Ignore this feature and do not forward it to the presenter. The interactions
-    // with scaling and rotation are not documented and do not seem very useful, as
-    // the present region serves as a scaling factor rather than clamping the source
-    // rect, and is applied post-rotation while the given coordinates are validated
-    // against the pre-rotation back buffer size. This Also appears to be a no-op
-    // with SCALING_STRETCH scaling, while introducing scaling for SCALING_NONE and
-    // actually enlarging the present region in that case.
     m_sourceSize.width = Width;
     m_sourceSize.height = Height;
     return S_OK;
@@ -1082,8 +1089,6 @@ namespace dxvk {
     if (!m_presenter2)
       return;
 
-    // Engage the frame limiter with large sync intervals even in windowed
-    // mode since we want to avoid double-presenting to the swap chain.
     if (SyncInterval != m_frameRateSyncInterval && m_descFs.Windowed) {
       bool engageLimiter = (SyncInterval > 1u) || (SyncInterval && m_hasLatencyControl);
 
@@ -1101,12 +1106,9 @@ namespace dxvk {
         }
       }
     } else if (!m_descFs.Windowed) {
-      // Reset tracking when in fullscreen mode
       m_frameRateSyncInterval = 0;
     }
 
-    // Use a negative number to indicate that the limiter should only
-    // be engaged if the target frame rate is actually exceeded
     double frameRate = m_frameRateOption;
 
     if (frameRate != -1.0) {
