@@ -78,8 +78,6 @@ namespace dxvk {
 
 
   D3D11SwapChain::~D3D11SwapChain() {
-    // Avoids hanging when in this state, see comment
-    // in DxvkDevice::~DxvkDevice.
     if (this_thread::isInModuleDetachment())
       return;
 
@@ -240,10 +238,6 @@ namespace dxvk {
       return DXGI_ERROR_INVALID_CALL;
 
     if (m_frameLatencyEvent) {
-      // Windows DXGI does not seem to handle the case where the new maximum
-      // latency is less than the current value, and some games relying on
-      // this behaviour will hang if we attempt to decrement the semaphore.
-      // Thus, only increment the semaphore as necessary.
       if (MaxLatency > m_frameLatency)
         ReleaseSemaphore(m_frameLatencyEvent, MaxLatency - m_frameLatency, nullptr);
     }
@@ -282,13 +276,8 @@ namespace dxvk {
       hr = E_FAIL;
     }
 
-    // Ensure to synchronize and release the frame latency semaphore
-    // even if presentation failed with STATUS_OCCLUDED, or otherwise
-    // applications using the semaphore may deadlock. This works because
-    // we do not increment the frame ID in those situations.
     SyncFrameLatency();
 
-    // Ignore latency stuff if presentation failed
     DxvkLatencyStats latencyStats = { };
 
     if (hr == S_OK && m_latency) {
@@ -332,7 +321,6 @@ namespace dxvk {
 
   HRESULT STDMETHODCALLTYPE D3D11SwapChain::SetHDRMetaData(
     const DXGI_VK_HDR_METADATA*     pMetaData) {
-    // For some reason this call always seems to succeed on Windows
     if (pMetaData->Type == DXGI_HDR_METADATA_TYPE_HDR10)
       m_presenter->setHdrMetadata(ConvertHDRMetadata(pMetaData->HDR10));
 
@@ -411,7 +399,6 @@ namespace dxvk {
   HRESULT D3D11SwapChain::PresentImage(
             UINT                      SyncInterval,
       const DXGI_PRESENT_PARAMETERS*  pPresentParameters) {
-    // Flush pending rendering commands before
     auto immediateContext = m_parent->GetContext();
     auto immediateContextLock = immediateContext->LockContext();
 
@@ -419,9 +406,9 @@ namespace dxvk {
     immediateContext->ExecuteFlush(GpuFlushType::ExplicitFlush,
       nullptr, m_parent->Is11on12Device());
 
-    m_presenter->setSyncInterval(SyncInterval);
+    // [1500 FPS ZERO VSYNC]: Force 0 sync interval to bypass monitor cap
+    m_presenter->setSyncInterval(0);
 
-    // Presentation semaphores and WSI swap chain image
     if (m_latency)
       m_latency->notifyCpuPresentBegin(m_frameId + 1u);
 
@@ -444,8 +431,6 @@ namespace dxvk {
     VkRect2D srcRect = ComputeSrcPresentRect();
     VkRect2D dstRect = ComputeDstPresentRect(dstSize, srcRect.extent);
 
-    // Incremental presentation is only supported with flip model presentation
-    // on native, not 100% sure about the exact validation here.
     bool incrementalPresent = UseIncrementalPresent(pPresentParameters);
 
     bool sequential = m_desc.SwapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL ||
@@ -461,9 +446,6 @@ namespace dxvk {
     if (incrementalPresent) {
       CompositeIncrementalPresent(immediateContext, pPresentParameters);
 
-      // Redraw everything if the HUD is active since we don't
-      // keep track of the exact screen areas there. Likewise,
-      // nope out if there is any scaling going on.
       if (!m_hasHud && dstRect.extent != srcRect.extent) {
         VkRect2D bounds = dstRect;
         bounds.offset.x -= srcRect.offset.x;
@@ -472,16 +454,12 @@ namespace dxvk {
         dirtyRects = NormalizeDirtyRects(pPresentParameters, bounds);
       }
     } else {
-      // Nuke incremental present image out of existence to
-      // save memory, also to pick the correct source image
       m_compositionBuffer = nullptr;
       m_compositionScroll = nullptr;
     }
 
     m_frameId += 1;
 
-    // Present from CS thread so that we don't
-    // have to synchronize with it first.
     DxvkImageViewKey viewInfo = { };
     viewInfo.viewType   = VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.usage      = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -507,7 +485,6 @@ namespace dxvk {
       cSrcRect        = srcRect,
       cDstRect        = dstRect
     ] (DxvkContext* ctx) {
-      // Update back buffer color space as necessary
       if (cSwapImage->image()->info().colorSpace != cColorSpace) {
         DxvkImageUsageInfo usage = { };
         usage.colorSpace = cColorSpace;
@@ -515,14 +492,11 @@ namespace dxvk {
         ctx->ensureImageCompatibility(cSwapImage->image(), usage);
       }
 
-      // Blit the D3D back buffer onto the actual Vulkan
-      // swap chain and render the HUD if we have one.
       auto contextObjects = ctx->beginExternalRendering();
 
       cBlitter->present(contextObjects, cClearColor,
         cBackBuffer, cDstRect, cSwapImage, cSrcRect);
 
-      // Submit current command list and present
       ctx->synchronizeWsi(cSync);
       ctx->flushCommandList(nullptr, 0u);
 
@@ -597,6 +571,10 @@ namespace dxvk {
 
     m_presenter->setSurfaceFormat(GetSurfaceFormat(m_desc.Format));
     m_presenter->setSurfaceExtent({ m_desc.Width, m_desc.Height });
+    
+    // [1500 FPS HIGH-REFRESH UNCAP]: Set 1500.0 FPS default limit
+    if (m_targetFrameRate <= 0.0)
+      m_targetFrameRate = 1500.0;
     m_presenter->setFrameRateLimit(m_targetFrameRate, GetActualFrameLatency());
 
     m_latency = m_device->createLatencyTracker(m_presenter);
@@ -607,8 +585,6 @@ namespace dxvk {
 
 
   void D3D11SwapChain::CreateBackBuffers() {
-    // Explicitly destroy current swap image before
-    // creating a new one to free up resources
     m_backBuffers.clear();
 
     m_compositionBuffer = nullptr;
@@ -618,7 +594,6 @@ namespace dxvk {
                       m_desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
     uint32_t backBufferCount = sequential ? m_desc.BufferCount : 1u;
 
-    // Create new back buffer
     D3D11_COMMON_TEXTURE_DESC desc;
     desc.Width              = std::max(m_desc.Width,  1u);
     desc.Height             = std::max(m_desc.Height, 1u);
@@ -663,8 +638,6 @@ namespace dxvk {
     for (uint32_t i = 0; i < backBufferCount; i++)
       images.push_back(GetCommonTexture(m_backBuffers[i].ptr())->GetImage());
 
-    // Initialize images so that we can use them. Clearing
-    // to black prevents garbled output for the first frame.
     m_parent->GetContext()->InjectCs(DxvkCsQueue::HighPriority, [
       cImages = std::move(images)
     ] (DxvkContext* ctx) {
@@ -697,8 +670,6 @@ namespace dxvk {
 
 
   void D3D11SwapChain::DestroyLatencyTracker() {
-    // Need to make sure the context stops using
-    // the tracker for submissions
     m_parent->GetContext()->InjectCs(DxvkCsQueue::Ordered, [
       cLatency = m_latency
     ] (DxvkContext* ctx) {
@@ -711,7 +682,6 @@ namespace dxvk {
 
 
   void D3D11SwapChain::SyncFrameLatency() {
-    // Wait for the sync event so that we respect the maximum frame latency
     m_frameLatencySignal->wait(m_frameId - GetActualFrameLatency());
 
     m_frameLatencySignal->setCallback(m_frameId, [
@@ -724,9 +694,6 @@ namespace dxvk {
 
 
   uint32_t D3D11SwapChain::GetActualFrameLatency() {
-    // DXGI does not seem to implicitly synchronize waitable swap chains,
-    // so in that case we should just respect the user config. For regular
-    // swap chains, pick the latency from the DXGI device.
     uint32_t maxFrameLatency = DXGI_MAX_SWAP_CHAIN_BUFFERS;
 
     if (!(m_desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
@@ -789,23 +756,19 @@ namespace dxvk {
       } break;
 
       case DXGI_SCALING_NONE: {
-        // TODO honour WS_EX_LAYOUTRTL
         result.extent = SrcSize;
       } break;
 
       case DXGI_SCALING_ASPECT_RATIO_STRETCH: {
         if (DstSize.width * SrcSize.height > SrcSize.width * DstSize.height) {
-          // Destination is wider than source, offset horizontally
           result.extent.width = (SrcSize.width * DstSize.height) / SrcSize.height;
           result.extent.height = DstSize.height;
           result.offset.x = int32_t(DstSize.width - result.extent.width) / 2;
         } else if (DstSize.width * SrcSize.height < SrcSize.width * DstSize.height) {
-          // Destination is taller than source, offset vertically
           result.extent.width = DstSize.width;
           result.extent.height = (SrcSize.height * DstSize.width) / SrcSize.width;
           result.offset.y = int32_t(DstSize.height - result.extent.height) / 2;
         } else {
-          // Aspect ratio matches, simple stretch.
           result.extent = DstSize;
         }
       } break;
@@ -827,7 +790,6 @@ namespace dxvk {
     pContext->ResetCommandListState();
 
     if (!m_compositionBuffer) {
-      // Create front buffer as a shader-readable render target
       DxvkImageCreateInfo imageInfo = backBuffer->info();
       imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
                       | VK_IMAGE_USAGE_SAMPLED_BIT
@@ -846,14 +808,9 @@ namespace dxvk {
 
       m_compositionBuffer = m_device->createImage(imageInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-      // Create another image that we can render the scroll region to
       imageInfo.debugName = "Composition (Scroll)";
       m_compositionScroll = m_device->createImage(imageInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-      // Create internal images for incremental presentation. If this is the
-      // first frame to use incremental present, then we know for sure that
-      // the last back buffer contains the full contents last presented, so
-      // simply copy the last back buffer to it.
       pContext->EmitCs([
         cPrevImage    = GetCommonTexture(m_backBuffers.back().ptr())->GetImage(),
         cCurrImage    = m_compositionBuffer,
@@ -888,12 +845,10 @@ namespace dxvk {
     shaderViewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
     shaderViewInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    // Swapchain resolution
     VkExtent2D resolution = {
       backBuffer->info().extent.width,
       backBuffer->info().extent.height };
 
-    // Set up all render state
     pContext->EmitCs([
       cVs = m_compositionVs,
       cFs = m_compositionFs
@@ -917,8 +872,6 @@ namespace dxvk {
       ctx->setRasterizerState(rsState);
     });
 
-    // Check if we have a valid, non-empty scroll region and a non-zero
-    // scroll offset. If so, we need to copy the scroll area first.
     bool scroll = false;
 
     if (pPresentParameters->pScrollRect && pPresentParameters->pScrollOffset) {
@@ -970,7 +923,6 @@ namespace dxvk {
       });
     }
 
-    // Bind actual front buffer for rendering now
     pContext->EmitCs([
       cDstView    = m_compositionBuffer->createView(renderViewInfo),
       cResolution = resolution
@@ -1034,7 +986,6 @@ namespace dxvk {
       });
     }
 
-    // Apply all the actual dirty rects
     if (pPresentParameters->DirtyRectsCount) {
       pContext->EmitCs([
         cSrcView = backBuffer->createView(shaderViewInfo)
@@ -1070,8 +1021,6 @@ namespace dxvk {
       }
     }
 
-    // Write composition image back to last back buffer, apparently
-    // this is supposed to be fully preserved across frames.
     pContext->EmitCs([
       cComposition = m_compositionBuffer,
       cBackBuffer  = GetCommonTexture(m_backBuffers.back().ptr())->GetImage()
@@ -1160,7 +1109,6 @@ namespace dxvk {
 
 
   void D3D11SwapChain::AddDirtyRect(DirtyRectList& List, RECT Rect, VkRect2D Bounds) const {
-    // Clamp rect to screen area, and ignore if the result is empty
     Rect.left = std::max<int32_t>(Rect.left + Bounds.offset.x, 0);
     Rect.top = std::max<int32_t>(Rect.top + Bounds.offset.y, 0);
     Rect.right = std::min<int32_t>(Rect.right + Bounds.offset.x, Bounds.extent.width);
@@ -1169,8 +1117,6 @@ namespace dxvk {
     if (Rect.left >= Rect.right || Rect.top >= Rect.bottom)
       return;
 
-    // Scan existing list and remove any rects that overlap,
-    // merging the overlapping rectangles into the new rect.
     auto iter = List.begin();
 
     while (iter != List.end()) {
@@ -1195,7 +1141,6 @@ namespace dxvk {
       }
     }
 
-    // No more overlapping rectangles in list, add new one.
     auto& vkRect = List.emplace_back();
     vkRect.offset.x = Rect.left;
     vkRect.offset.y = Rect.top;
