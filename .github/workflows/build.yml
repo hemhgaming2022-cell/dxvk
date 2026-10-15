@@ -11,6 +11,8 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Setup MinGW & Meson Compiler
         run: |
@@ -24,9 +26,7 @@ jobs:
             mingw-w64-tools \
             wine \
             wine32 \
-            wine64 \
-            vulkan-headers \
-            libvulkan-dev
+            wine64
 
       - name: Compile DXVK Binaries
         run: |
