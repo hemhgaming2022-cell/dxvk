@@ -24,7 +24,9 @@ jobs:
             mingw-w64-tools \
             wine \
             wine32 \
-            wine64
+            wine64 \
+            vulkan-headers \
+            libvulkan-dev
 
       - name: Compile DXVK Binaries
         run: |
